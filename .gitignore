@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Models (downloaded at runtime)
+models/
+checkpoints/
+*.pth
+*.pt
+*.safetensors
+*.onnx
+
+# Config with secrets
+config.local.yaml
+.env
+
+# Audio uploads (keep voices/ directory with sample data)
+voices/*/
+!voices/.gitkeep
+!voices/*/speaker.yaml
+!voices/*/reference.wav
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradio
+gradio_cached_examples/
+flagged/

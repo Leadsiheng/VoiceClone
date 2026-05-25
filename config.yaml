@@ -1,0 +1,43 @@
+# VoiceClone Configuration
+# Copy this file to config.local.yaml and modify for your setup
+
+llm:
+  # Backend: "deepseek" (API) or "ollama" (local)
+  backend: deepseek
+
+  deepseek:
+    api_key: "sk-your-api-key-here"
+    api_base: "https://api.deepseek.com/v1"
+    model: "deepseek-chat"
+    max_tokens: 512
+    temperature: 0.7
+
+  ollama:
+    host: "http://localhost:11434"
+    model: "gemma4:latest"
+    num_predict: 256
+    temperature: 0.7
+
+tts:
+  engine: cosyvoice
+  # CosyVoice model: CosyVoice-300M / CosyVoice-300M-SFT / CosyVoice-300M-Instruct
+  model: "CosyVoice-300M-SFT"
+  # Path to CosyVoice project (clone from https://github.com/FunAudioLLM/CosyVoice)
+  cosyvoice_path: "../CosyVoice"
+  # Directory containing speaker voice samples
+  voices_dir: "./voices"
+  # Sample rate for audio output
+  sample_rate: 22050
+
+asr:
+  engine: funasr
+  # FunASR model for Chinese recognition
+  model: "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+  # Enable Voice Activity Detection
+  vad_model: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+
+server:
+  host: "0.0.0.0"
+  port: 7860
+  # Enable Gradio public sharing link (creates temp URL for friends)
+  share: true
