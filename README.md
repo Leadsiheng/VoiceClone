@@ -30,7 +30,7 @@ python --version
 
 ```powershell
 # Clone this project
-git clone https://github.com/YOUR_USERNAME/VoiceClone.git
+git clone https://github.com/Leadsiheng/VoiceClone.git
 cd VoiceClone
 
 # Clone CosyVoice (required for voice cloning)
