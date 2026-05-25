@@ -19,15 +19,20 @@ llm:
     temperature: 0.7
 
 tts:
-  engine: cosyvoice
-  # CosyVoice model: CosyVoice-300M / CosyVoice-300M-SFT / CosyVoice-300M-Instruct
-  model: "CosyVoice-300M-SFT"
-  # Path to CosyVoice project (clone from https://github.com/FunAudioLLM/CosyVoice)
-  cosyvoice_path: "../CosyVoice"
+  engine: indextts2
+  # Path to index-tts project (clone from https://github.com/index-tts/index-tts.git)
+  index_tts_dir: "../index-tts"
+  # Model checkpoint paths (relative to index_tts_dir)
+  cfg_path: "checkpoints/config.yaml"
+  model_dir: "checkpoints"
+  # Performance options
+  use_fp16: false          # FP16 inference (lower VRAM, slight quality loss)
+  use_cuda_kernel: false    # CUDA compiled kernels (NVIDIA only)
+  use_deepspeed: false      # DeepSpeed acceleration (experimental)
+  # Sample rate for audio output (IndexTTS2 default is 24000)
+  sample_rate: 24000
   # Directory containing speaker voice samples
   voices_dir: "./voices"
-  # Sample rate for audio output
-  sample_rate: 22050
 
 asr:
   engine: funasr

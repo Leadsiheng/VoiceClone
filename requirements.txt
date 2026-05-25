@@ -1,16 +1,10 @@
 # VoiceClone Dependencies
 # Install with: pip install -r requirements.txt
 #
-# Prerequisites - Install CosyVoice first:
-#   git clone https://github.com/FunAudioLLM/CosyVoice.git ../CosyVoice
-#   cd ../CosyVoice && pip install -r requirements.txt
-
-# Core ML
-torch>=2.0.0
-torchaudio>=2.0.0
-
-# CosyVoice (for model download)
-modelscope>=1.14.0
+# Prerequisites (IndexTTS2):
+#   git clone https://github.com/index-tts/index-tts.git ../index-tts
+#   cd ../index-tts && uv sync --all-extras
+#   (IndexTTS2 manages its own dependencies via uv, not pip)
 
 # ASR
 funasr>=1.0.0
@@ -25,8 +19,10 @@ gradio>=4.0.0
 
 # Audio
 soundfile>=0.12.0
-librosa>=0.10.0
 numpy>=1.24.0
 
 # Config
 pyyaml>=6.0
+
+# Subprocess management
+psutil>=5.9.0
