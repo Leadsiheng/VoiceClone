@@ -1,6 +1,6 @@
 """
-LLM Engine — supports DeepSeek API and Ollama local models.
-Each speaker voice can have its own system prompt.
+LLM Engine — stateless single-turn chat.
+Each call is independent, no conversation history.
 """
 from typing import Optional
 
@@ -18,35 +18,43 @@ class LLMEngine:
         self.backend = llm_config.get("backend", "deepseek")
 
         if self.backend == "deepseek":
-            ds_config = llm_config["deepseek"]
+            ds = llm_config["deepseek"]
             self.client = OpenAI(
-                api_key=ds_config["api_key"],
-                base_url=ds_config.get("api_base", "https://api.deepseek.com/v1"),
+                api_key=ds["api_key"],
+                base_url=ds.get("api_base", "https://api.deepseek.com/v1"),
             )
-            self.model = ds_config.get("model", "deepseek-chat")
-            self.max_tokens = ds_config.get("max_tokens", 512)
-            self.temperature = ds_config.get("temperature", 0.7)
+            self.model = ds.get("model", "deepseek-chat")
+            self.max_tokens = ds.get("max_tokens", 256)
+            self.temperature = ds.get("temperature", 0.8)
         elif self.backend == "ollama":
-            ol_config = llm_config["ollama"]
-            self.host = ol_config.get("host", "http://localhost:11434")
-            self.model = ol_config.get("model", "gemma4:latest")
-            self.num_predict = ol_config.get("num_predict", 256)
-            self.temperature = ol_config.get("temperature", 0.7)
+            ol = llm_config["ollama"]
+            self.host = ol.get("host", "http://localhost:11434")
+            self.model = ol.get("model", "gemma4:latest")
+            self.num_predict = ol.get("num_predict", 128)
+            self.temperature = ol.get("temperature", 0.8)
         else:
             raise ValueError(f"Unknown LLM backend: {self.backend}")
 
-        self.histories: dict[str, list[dict]] = {}
+    def chat(self, message: str, system_prompt: str = "") -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
 
-    def _call_deepseek(self, messages: list[dict]) -> str:
-        response = self.client.chat.completions.create(
+        if self.backend == "deepseek":
+            return self._call_deepseek(messages)
+        return self._call_ollama(messages)
+
+    def _call_deepseek(self, messages: list) -> str:
+        resp = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
-        return response.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
 
-    def _call_ollama(self, messages: list[dict]) -> str:
+    def _call_ollama(self, messages: list) -> str:
         resp = requests.post(
             f"{self.host}/api/chat",
             json={
@@ -62,36 +70,3 @@ class LLMEngine:
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
-
-    def chat(self, message: str, speaker_id: str, system_prompt: Optional[str] = None) -> str:
-        if speaker_id not in self.histories:
-            self.histories[speaker_id] = []
-
-            if system_prompt:
-                self.histories[speaker_id].append({
-                    "role": "system",
-                    "content": system_prompt,
-                })
-
-        self.histories[speaker_id].append({"role": "user", "content": message})
-
-        if self.backend == "deepseek":
-            reply = self._call_deepseek(self.histories[speaker_id])
-        else:
-            reply = self._call_ollama(self.histories[speaker_id])
-
-        self.histories[speaker_id].append({"role": "assistant", "content": reply})
-
-        return reply
-
-    def reset_history(self, speaker_id: str):
-        self.histories.pop(speaker_id, None)
-
-    def set_system_prompt(self, speaker_id: str, prompt: str):
-        if speaker_id in self.histories:
-            if self.histories[speaker_id] and self.histories[speaker_id][0]["role"] == "system":
-                self.histories[speaker_id][0] = {"role": "system", "content": prompt}
-            else:
-                self.histories[speaker_id].insert(0, {"role": "system", "content": prompt})
-        else:
-            self.histories[speaker_id] = [{"role": "system", "content": prompt}]

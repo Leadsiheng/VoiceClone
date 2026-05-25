@@ -127,6 +127,35 @@ class TTSEngine:
 
         return audio
 
+    def extract_envelope(self, audio: torch.Tensor, num_frames: int = 80) -> list:
+        """Extract RMS amplitude envelope from audio for waveform animation.
+        
+        Returns list of floats (0-1) — one per frame.
+        """
+        audio_np = audio.detach().cpu().numpy()
+        total = len(audio_np)
+        frame_size = max(total // num_frames, 1)
+
+        envelope = []
+        for i in range(num_frames):
+            start = i * frame_size
+            end = min(start + frame_size, total)
+            if start >= total:
+                break
+            rms = np.sqrt(np.mean(audio_np[start:end] ** 2))
+            envelope.append(float(rms))
+
+        if not envelope:
+            return [0.0] * num_frames
+
+        max_val = max(envelope) or 1e-8
+        envelope = [min(v / max_val, 1.0) for v in envelope]
+
+        if len(envelope) < num_frames:
+            envelope.extend([0.0] * (num_frames - len(envelope)))
+
+        return envelope[:num_frames]
+
     def get_speaker_list(self) -> list:
         return [
             {"id": sp["id"], "name": sp["name"]}

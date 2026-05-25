@@ -1,13 +1,18 @@
 """
 VoiceClone — Zero-shot voice cloning + conversational AI.
-Web UI powered by Gradio.
+New UI matching prototype design.
 """
 import os
+import tempfile
+import time
 import warnings
 from pathlib import Path
 
 import gradio as gr
-import yaml
+import numpy as np
+import soundfile as sf
+
+from prompts import STYLES, DEFAULT_STYLE, get_style_prompt, get_style_list
 
 warnings.filterwarnings("ignore")
 
@@ -17,29 +22,30 @@ _asr = None
 
 
 def _scan_voices() -> list:
+    import yaml
     voices = []
-    voices_dir = Path("voices")
-    if not voices_dir.exists():
+    vdir = Path("voices")
+    if not vdir.exists():
         return voices
-    for d in sorted(voices_dir.iterdir()):
+    for d in sorted(vdir.iterdir()):
         if not d.is_dir():
             continue
         if not (d / "reference.wav").exists():
             continue
-        speaker_yaml = d / "speaker.yaml"
+        sy = d / "speaker.yaml"
         name = d.name
-        if speaker_yaml.exists():
-            with open(speaker_yaml, "r", encoding="utf-8") as f:
+        if sy.exists():
+            with open(sy, "r", encoding="utf-8") as f:
                 info = yaml.safe_load(f) or {}
             name = info.get("name", d.name)
         voices.append({"id": d.name, "name": name})
     return voices
 
 
-def _speaker_id_from_name(name: str) -> str:
-    for sp in _scan_voices():
-        if sp["name"] == name:
-            return sp["id"]
+def _voice_id(name: str) -> str:
+    for v in _scan_voices():
+        if v["name"] == name:
+            return v["id"]
     return ""
 
 
@@ -70,260 +76,516 @@ def _get_asr():
     return _asr
 
 
-def _speaker_info(speaker_id: str) -> dict:
-    tts = _get_tts()
-    return tts.speakers.get(speaker_id, {})
+def _save_audio(audio_tensor, sample_rate: int) -> str:
+    audio_np = audio_tensor.cpu().numpy()
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    sf.write(tmp.name, audio_np, sample_rate)
+    tmp.close()
+    return tmp.name
 
 
-def load_voices_on_start():
-    voices = _scan_voices()
-    choices = [v["name"] for v in voices]
-    return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+# ── Callbacks ──
+
+def on_mode_change(mode: str):
+    is_chat = mode in ("语音聊天", "发送短信")
+    return (
+        gr.Column(visible=(mode == "语音聊天")),
+        gr.Column(visible=(mode == "发送短信")),
+        gr.Column(visible=(mode == "朗读内容")),
+        gr.Dropdown(visible=is_chat),
+    )
 
 
-def text_chat(message: str, voice_name: str, chat_history: list):
-    if not message.strip():
-        return "", chat_history, None, ""
-
-    speaker_id = _speaker_id_from_name(voice_name)
-    if not speaker_id:
-        return "", chat_history, None, f"Unknown voice: {voice_name}"
-
-    tts = _get_tts()
-    llm = _get_llm()
-
-    sp = _speaker_info(speaker_id)
-    system_prompt = sp.get("system_prompt")
-
-    try:
-        reply = llm.chat(message, speaker_id, system_prompt)
-    except Exception as e:
-        chat_history.append((message, f"[LLM Error] {e}"))
-        return "", chat_history, None, ""
-
-    try:
-        audio = tts.synthesize(reply, speaker_id)
-        audio_np = audio.cpu().numpy()
-        audio_output = (tts.sample_rate, audio_np)
-    except Exception as e:
-        chat_history.append((message, reply))
-        return "", chat_history, None, f"[TTS Error] {e}"
-
-    chat_history.append((message, reply))
-    return "", chat_history, audio_output, ""
-
-
-def voice_chat(audio_input, voice_name: str, chat_history: list):
-    empty = None, chat_history, None, ""
-
-    if audio_input is None:
-        return empty
-
-    speaker_id = _speaker_id_from_name(voice_name)
-    if not speaker_id:
-        return None, chat_history, None, f"Unknown voice: {voice_name}"
+def on_voice_chat(audio_path: str, voice_name: str, style_name: str):
+    if audio_path is None:
+        return None, ""
 
     tts = _get_tts()
     llm = _get_llm()
     asr_engine = _get_asr()
+    vid = _voice_id(voice_name)
 
-    try:
-        if isinstance(audio_input, str):
-            transcript = asr_engine.recognize(audio_input)
-        elif isinstance(audio_input, tuple) and len(audio_input) == 2:
-            sr, arr = audio_input
-            transcript = asr_engine.recognize_array(arr, sr)
-        else:
-            return None, chat_history, None, "[ASR] Invalid audio format."
-    except Exception as e:
-        return None, chat_history, None, f"[ASR Error] {e}"
+    if not vid:
+        return None, f"未找到声音: {voice_name}"
 
+    transcript = asr_engine.recognize(audio_path)
     if not transcript:
-        return None, chat_history, None, "[ASR] No speech detected."
+        return None, "未检测到语音。"
 
-    sp = _speaker_info(speaker_id)
-    system_prompt = sp.get("system_prompt")
+    prompt = get_style_prompt(style_name)
+    try:
+        reply = llm.chat(transcript, prompt)
+    except Exception as e:
+        return None, f"LLM 错误: {e}"
 
     try:
-        reply = llm.chat(transcript, speaker_id, system_prompt)
+        audio = tts.synthesize(reply, vid)
+        audio_path_out = _save_audio(audio, tts.sample_rate)
+        return audio_path_out, f"「{reply}」"
     except Exception as e:
-        chat_history.append((transcript, f"[LLM Error] {e}"))
-        return None, chat_history, None, ""
-
-    try:
-        audio = tts.synthesize(reply, speaker_id)
-        audio_np = audio.cpu().numpy()
-        audio_output = (tts.sample_rate, audio_np)
-    except Exception as e:
-        chat_history.append((transcript, reply))
-        return None, chat_history, None, f"[TTS Error] {e}"
-
-    chat_history.append((transcript, reply))
-    return None, chat_history, audio_output, ""
+        return None, f"TTS 错误: {e}"
 
 
-def reset_chat(voice_name: str):
-    speaker_id = _speaker_id_from_name(voice_name)
-    if speaker_id:
-        try:
-            llm = _get_llm()
-            llm.reset_history(speaker_id)
-        except Exception:
-            pass
-    return [], None, ""
-
-
-def add_voice(name: str, audio_file, ref_text: str, system_prompt: str):
-    if not name.strip():
-        return "Please enter a voice name.", gr.Dropdown(), None
-
-    if audio_file is None:
-        return "Please upload a reference audio file.", gr.Dropdown(), None
-
-    speaker_id = name.lower().replace(" ", "_")
-
-    if isinstance(audio_file, str):
-        audio_path = audio_file
-    elif isinstance(audio_file, tuple) and len(audio_file) == 2:
-        import tempfile
-        import soundfile as sf
-        sr, arr = audio_file
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(tmp.name, arr, sr)
-        audio_path = tmp.name
-        tmp.close()
-    else:
-        return "Invalid audio format.", gr.Dropdown(), None
+def on_sms(text: str, voice_name: str, style_name: str):
+    if not text.strip():
+        return None, ""
 
     tts = _get_tts()
+    llm = _get_llm()
+    vid = _voice_id(voice_name)
+
+    if not vid:
+        return None, f"未找到声音: {voice_name}"
+
+    prompt = get_style_prompt(style_name)
     try:
-        tts.add_speaker(speaker_id, name, audio_path, ref_text, system_prompt)
+        reply = llm.chat(text, prompt)
     except Exception as e:
-        return f"Error adding voice: {e}", gr.Dropdown(), None
+        return None, f"LLM 错误: {e}"
 
-    voices = _scan_voices()
-    choices = [v["name"] for v in voices]
-    return f"Voice '{name}' added successfully!", gr.Dropdown(choices=choices, value=name), None
+    try:
+        audio = tts.synthesize(reply, vid)
+        audio_path_out = _save_audio(audio, tts.sample_rate)
+        return audio_path_out, f"「{reply}」"
+    except Exception as e:
+        return None, f"TTS 错误: {e}"
 
 
-def on_voice_change(voice_name: str):
-    return reset_chat(voice_name)
+def on_read(text: str, voice_name: str):
+    if not text.strip():
+        return None, ""
+
+    tts = _get_tts()
+    vid = _voice_id(voice_name)
+
+    if not vid:
+        return None, f"未找到声音: {voice_name}"
+
+    try:
+        audio = tts.synthesize(text, vid)
+        audio_path_out = _save_audio(audio, tts.sample_rate)
+        return audio_path_out, f"朗读:「{text}」"
+    except Exception as e:
+        return None, f"TTS 错误: {e}"
 
 
-css = """
-.gradio-container { max-width: 900px !important; margin: auto !important; }
-.status-text { color: #888; font-size: 0.85em; }
+# ── Waveform HTML + JS (Web Audio API driven) ──
+
+WAVEFORM_HTML = """
+<div id="waveform-wrap" style="width:100%;height:260px;position:relative;margin-bottom:6px;">
+  <canvas id="waveform-canvas" style="width:100%;height:260px;display:block;"></canvas>
+</div>
+
+<script>
+(function(){
+const canvas = document.getElementById('waveform-canvas');
+const ctx = canvas.getContext('2d');
+const BAR_COUNT = 45;
+const DPR = window.devicePixelRatio || 1;
+
+function resizeWave() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * DPR;
+  canvas.height = rect.height * DPR;
+  ctx.scale(DPR, DPR);
+}
+resizeWave();
+new ResizeObserver(resizeWave).observe(canvas.parentElement);
+
+const phases = Array.from({length:BAR_COUNT},()=>Math.random()*Math.PI*2);
+const speeds = Array.from({length:BAR_COUNT},()=>0.5+Math.random()*1.2);
+
+// State
+let targetVolume = 0;
+let currentVolume = 0;
+const BREATH_AMP = 0.055;
+const SPEAK_AMP = 0.75;
+const VOLUME_LERP = 0.06;
+
+// Audio analyser
+let audioCtx = null;
+let analyser = null;
+let freqData = null;
+let isPlaying = false;
+
+function setupAudioContext() {
+  // Find Gradio's audio element
+  const audios = document.querySelectorAll('audio');
+  for (const audio of audios) {
+    if (audio.dataset.waveformHooked) continue;
+    audio.dataset.waveformHooked = '1';
+
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 128;
+      analyser.smoothingTimeConstant = 0.5;
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+    }
+
+    try {
+      const source = audioCtx.createMediaElementSource(audio);
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination);
+    } catch(e) { /* already connected */ }
+
+    audio.addEventListener('play', () => {
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      isPlaying = true;
+    });
+    audio.addEventListener('ended', () => { isPlaying = false; });
+    audio.addEventListener('pause', () => { isPlaying = false; });
+  }
+}
+
+let time = 0;
+function drawWave() {
+  requestAnimationFrame(drawWave);
+  const dt = 0.016;
+  time += dt;
+
+  // Periodically check for new audio elements
+  if (Math.floor(time * 10) % 20 === 0) setupAudioContext();
+
+  // Get live volume from analyser if playing
+  let liveVol = 0;
+  if (isPlaying && analyser && freqData) {
+    analyser.getByteFrequencyData(freqData);
+    let sum = 0;
+    for (let i = 0; i < freqData.length; i++) sum += freqData[i];
+    liveVol = (sum / freqData.length) / 255;
+    liveVol = Math.pow(liveVol, 0.6); // perceptual curve
+  }
+
+  // Blend target: live audio volume when playing, 0 when not
+  targetVolume = liveVol > 0.02 ? liveVol : 0;
+  currentVolume += (targetVolume - currentVolume) * VOLUME_LERP;
+
+  const W = canvas.width / DPR;
+  const H = canvas.height / DPR;
+  const CY = H / 2;
+  const barW = W / BAR_COUNT * 0.50;
+  const gap = W / BAR_COUNT * 0.50;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Baseline
+  ctx.strokeStyle = '#e8e8e3';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, CY);
+  ctx.lineTo(W, CY);
+  ctx.stroke();
+
+  for (let i = 0; i < BAR_COUNT; i++) {
+    const x = i * (barW + gap) + gap / 2;
+    const t = time * speeds[i];
+    const organic = Math.sin(t * 2.5 + phases[i]);
+    const noise = Math.sin(t * 5.1 + phases[i] * 1.7) * 0.4 +
+                  Math.sin(t * 9.3 + phases[i] * 0.9) * 0.25 +
+                  Math.sin(t * 15.7 + phases[i] * 0.4) * 0.15;
+    const vibrato = Math.sin(i * 0.3 + time * 0.4) * 0.06 * currentVolume;
+
+    // Map bar to frequency bin for live audio
+    let liveBar = 0;
+    if (liveVol > 0.02 && freqData) {
+      const binIdx = Math.floor(i / BAR_COUNT * freqData.length);
+      liveBar = (freqData[binIdx] || 0) / 255;
+      liveBar = Math.pow(liveBar, 0.6);
+    }
+
+    const breathe = organic * 0.045 + noise * 0.012;
+    const speakLive = liveBar * 0.65 + organic * 0.15 * liveVol;
+    const speak = currentVolume > 0.05 ? speakLive : (organic * 0.55 + noise * 0.22 + vibrato) * currentVolume;
+    const amplitude = breathe + speak;
+
+    const halfH = Math.abs(amplitude) * H * 0.45;
+    const top = CY - halfH;
+    const bot = CY + halfH;
+
+    const dist = Math.abs(i - BAR_COUNT / 2) / (BAR_COUNT / 2);
+    const alpha = 0.6 - dist * 0.35;
+
+    ctx.fillStyle = `rgba(40,40,40,${alpha})`;
+    const r = barW * 0.45;
+    ctx.beginPath();
+    ctx.moveTo(x, top + r);
+    ctx.arcTo(x, top, x + barW, top, r);
+    ctx.arcTo(x + barW, top, x + barW, bot, r);
+    ctx.arcTo(x + barW, bot, x, bot, r);
+    ctx.arcTo(x, bot, x, top, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+drawWave();
+})();
+</script>
+"""
+
+# ── CSS ──
+
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500&display=swap');
+
+* { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif !important; }
+
+body, .gradio-container { background: #fafaf7 !important; }
+
+/* Hide default footer */
 footer { display: none !important; }
+
+/* ── App container ── */
+.gradio-container { max-width: 680px !important; margin: 0 auto !important; }
+.contain { padding: 40px 40px 30px !important; }
+
+/* ── Voice dropdown (small, light, centered) ── */
+#voice-selector {
+  display: flex !important; justify-content: center !important;
+  margin-bottom: 242px !important; margin-top: 6px !important;
+}
+#voice-selector .wrap { max-width: 130px !important; }
+#voice-selector select, #voice-selector input[type="text"] {
+  background: #f6f6f3 !important; border: 1px solid #e8e8e2 !important;
+  color: #aaa !important; font-size: 12px !important;
+  padding: 4px 24px 4px 10px !important; border-radius: 6px !important;
+  text-align: center !important; letter-spacing: 0.5px !important;
+  min-height: auto !important; height: auto !important;
+}
+#voice-selector label { display: none !important; }
+
+/* ── Control row (mode tabs + style) ── */
+#control-row {
+  display: flex !important; align-items: center !important;
+  justify-content: center !important; gap: 16px !important;
+  margin-bottom: 36px !important;
+}
+
+/* ── Mode radio (pill style) ── */
+#mode-radio {
+  background: #ecece6 !important; border-radius: 9px !important;
+  padding: 3px !important; border: none !important;
+}
+#mode-radio .wrap { gap: 0 !important; }
+#mode-radio label {
+  padding: 8px 22px !important; border-radius: 7px !important;
+  font-size: 13px !important; color: #aaa !important;
+  cursor: pointer !important; background: transparent !important;
+  margin: 0 !important; border: none !important;
+  box-shadow: none !important;
+}
+#mode-radio label.selected {
+  background: #fff !important; color: #1a1a1a !important;
+  font-weight: 500 !important;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
+}
+#mode-radio input[type="radio"] { display: none !important; }
+
+/* ── Style dropdown ── */
+#style-selector .wrap { max-width: 150px !important; }
+#style-selector select, #style-selector input[type="text"] {
+  background: #f6f6f3 !important; border: 1px solid #e4e4dd !important;
+  color: #aaa !important; font-size: 12px !important;
+  padding: 6px 28px 6px 12px !important; border-radius: 8px !important;
+  text-align: center !important; min-height: auto !important;
+}
+#style-selector label { display: none !important; }
+
+/* ── Mic button (hidden, we use HTML) ── */
+#mic-audio { display: none !important; }
+
+/* ── Text input ── */
+#sms-input input, #read-input input {
+  padding: 14px 20px !important; border: 1px solid #e0e0da !important;
+  border-radius: 24px !important; background: #fff !important;
+  font-size: 15px !important; outline: none !important;
+}
+#sms-input input::placeholder, #read-input input::placeholder { color: #c8c8c2 !important; }
+#sms-input input:focus, #read-input input:focus { border-color: #b0b0b0 !important; }
+
+/* ── Send button ── */
+#sms-btn, #read-btn {
+  width: 48px !important; height: 48px !important; min-width: 48px !important;
+  border-radius: 50% !important; border: 1px solid #e0e0da !important;
+  background: #fff !important; cursor: pointer !important;
+  display: flex !important; align-items: center !important; justify-content: center !important;
+  font-size: 18px !important; padding: 0 !important;
+}
+#sms-btn:hover, #read-btn:hover {
+  background: #1a1a1a !important; border-color: #1a1a1a !important; color: #fff !important;
+}
+
+/* ── Response toast ── */
+#response-toast .prose { text-align: center !important; font-size: 14px !important;
+  color: #aaa !important; padding: 4px 0 !important; min-height: 22px !important; }
+#response-toast { margin-top: 14px !important; }
+
+/* ── Mic custom button ── */
+.mic-btn-wrap { display: flex; justify-content: center; }
+.mic-btn {
+  width: 88px; height: 88px; border-radius: 50%;
+  border: 2px solid #e0e0da; background: #fff;
+  cursor: pointer; display: flex; align-items: center;
+  justify-content: center; transition: all 0.25s;
+  position: relative; font-size: 24px; color: #1a1a1a;
+}
+.mic-btn:hover { border-color: #b0b0b0; background: #f4f4f2; }
+.mic-btn.recording {
+  border-color: #e04545; background: #fef5f5; color: #e04545;
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224,69,69,0.2); }
+  50% { box-shadow: 0 0 0 16px rgba(224,69,69,0.02); }
+}
+
+/* ── Hide Gradio default labels ── */
+#voice-chat-panel > label, #sms-panel > label, #read-panel > label { display: none !important; }
 """
 
 
 def create_demo():
-    with gr.Blocks(title="VoiceClone", css=css, theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# VoiceClone")
-        gr.Markdown("Zero-shot voice cloning + conversational AI. Text or voice input, cloned voice output.")
+    style_list = get_style_list()
+    voice_choices = [v["name"] for v in _scan_voices()] or ["彪", "喆", "鑫"]
 
-        with gr.Row():
-            voice_selector = gr.Dropdown(
-                label="Voice",
-                choices=[],
+    with gr.Blocks(
+        title="VoiceClone",
+        css=CSS,
+        head='<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+    ) as demo:
+
+        # ── Waveform ──
+        gr.HTML(WAVEFORM_HTML)
+
+        # ── Voice Selector ──
+        voice_dd = gr.Dropdown(
+            choices=voice_choices,
+            value=voice_choices[0] if voice_choices else None,
+            elem_id="voice-selector",
+            show_label=False,
+            interactive=True,
+        )
+
+        # ── Mode + Style Row ──
+        with gr.Row(elem_id="control-row"):
+            mode_radio = gr.Radio(
+                choices=["语音聊天", "发送短信", "朗读内容"],
+                value="语音聊天",
+                elem_id="mode-radio",
+                show_label=False,
                 interactive=True,
-                scale=3,
             )
-            reset_btn = gr.Button("Reset Chat", variant="secondary", scale=1)
+            style_dd = gr.Dropdown(
+                choices=style_list,
+                value=DEFAULT_STYLE,
+                elem_id="style-selector",
+                show_label=False,
+                visible=True,
+                interactive=True,
+            )
 
-        status_text = gr.Markdown("", elem_classes=["status-text"])
+        # ── Interaction Area ──
+        with gr.Column(visible=True, elem_id="voice-chat-panel") as voice_panel:
+            gr.HTML("""
+            <div class="mic-btn-wrap">
+              <button class="mic-btn" id="custom-mic-btn" type="button">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <rect x="8" y="2" width="8" height="13" rx="4"/>
+                  <path d="M4 11a8 8 0 0 0 16 0"/>
+                  <line x1="12" y1="18" x2="12" y2="22"/>
+                </svg>
+              </button>
+            </div>
+            <script>
+            (function(){
+              const micBtn = document.getElementById('custom-mic-btn');
+              let recording = false;
+              micBtn.addEventListener('click', () => {
+                recording = !recording;
+                micBtn.classList.toggle('recording', recording);
+                // Trigger Gradio's hidden mic component
+                const micAudio = document.querySelector('#mic-audio audio') ||
+                                 document.querySelector('#mic-audio button');
+                if (micAudio) micAudio.click();
+              });
+            })();
+            </script>
+            """)
+            mic_audio = gr.Audio(
+                sources=["microphone"],
+                type="filepath",
+                elem_id="mic-audio",
+                show_label=False,
+            )
 
-        with gr.Tabs():
-            with gr.TabItem("Text Chat"):
-                chatbot = gr.Chatbot(label="Conversation", height=400)
-                audio_output = gr.Audio(label="Voice Reply", autoplay=True, type="numpy")
-
-                with gr.Row():
-                    text_input = gr.Textbox(
-                        label="Your message",
-                        placeholder="Type your message here and press Enter...",
-                        scale=4,
-                    )
-                    send_btn = gr.Button("Send", variant="primary", scale=1)
-
-                text_chat_event = send_btn.click(
-                    fn=text_chat,
-                    inputs=[text_input, voice_selector, chatbot],
-                    outputs=[text_input, chatbot, audio_output, status_text],
+        with gr.Column(visible=False, elem_id="sms-panel") as sms_panel:
+            with gr.Row():
+                sms_input = gr.Textbox(
+                    placeholder="输入消息...",
+                    elem_id="sms-input",
+                    show_label=False,
+                    scale=5,
                 )
-                text_input.submit(
-                    fn=text_chat,
-                    inputs=[text_input, voice_selector, chatbot],
-                    outputs=[text_input, chatbot, audio_output, status_text],
+                sms_btn = gr.Button("➤", elem_id="sms-btn", scale=1, size="sm")
+
+        with gr.Column(visible=False, elem_id="read-panel") as read_panel:
+            with gr.Row():
+                read_input = gr.Textbox(
+                    placeholder="输入要朗读的文字...",
+                    elem_id="read-input",
+                    show_label=False,
+                    scale=5,
                 )
+                read_btn = gr.Button("➤", elem_id="read-btn", scale=1, size="sm")
 
-            with gr.TabItem("Voice Chat"):
-                voice_chatbot = gr.Chatbot(label="Conversation", height=400)
-                voice_audio_output = gr.Audio(label="Voice Reply", autoplay=True, type="numpy")
+        # ── Output ──
+        output_audio = gr.Audio(
+            autoplay=True,
+            visible=False,
+            show_label=False,
+        )
+        response_toast = gr.Markdown("", elem_id="response-toast")
 
-                voice_input = gr.Audio(
-                    label="Your voice",
-                    type="numpy",
-                    sources=["microphone", "upload"],
-                )
+        # ── Events ──
 
-                voice_input.stop_recording(
-                    fn=voice_chat,
-                    inputs=[voice_input, voice_selector, voice_chatbot],
-                    outputs=[voice_input, voice_chatbot, voice_audio_output, status_text],
-                )
-
-            with gr.TabItem("Voice Management"):
-                gr.Markdown("### Add a new voice for cloning")
-                gr.Markdown(
-                    "Upload 3-15 seconds of clear, natural speech. "
-                    "Best results: quiet environment, normal speaking style."
-                )
-
-                with gr.Row():
-                    with gr.Column():
-                        new_name = gr.Textbox(label="Voice Name", placeholder="e.g. Alice")
-                        new_audio = gr.Audio(
-                            label="Reference Audio (3-15 sec)",
-                            type="numpy",
-                            sources=["upload", "microphone"],
-                        )
-                    with gr.Column():
-                        new_ref_text = gr.Textbox(
-                            label="Reference Text",
-                            placeholder="What does the person say in the audio? (optional)",
-                            lines=2,
-                        )
-                        new_system_prompt = gr.Textbox(
-                            label="System Prompt",
-                            placeholder="Personality / character description for the AI...",
-                            lines=4,
-                        )
-
-                add_btn = gr.Button("Add Voice", variant="primary")
-                add_status = gr.Markdown("")
-
-                add_btn.click(
-                    fn=add_voice,
-                    inputs=[new_name, new_audio, new_ref_text, new_system_prompt],
-                    outputs=[add_status, voice_selector, new_audio],
-                )
-
-        reset_btn.click(
-            fn=reset_chat,
-            inputs=[voice_selector],
-            outputs=[chatbot, audio_output, status_text],
+        mode_radio.change(
+            fn=on_mode_change,
+            inputs=[mode_radio],
+            outputs=[voice_panel, sms_panel, read_panel, style_dd],
         )
 
-        voice_selector.change(
-            fn=on_voice_change,
-            inputs=[voice_selector],
-            outputs=[chatbot, audio_output, status_text],
+        mic_audio.stop_recording(
+            fn=on_voice_chat,
+            inputs=[mic_audio, voice_dd, style_dd],
+            outputs=[output_audio, response_toast],
         )
 
-        demo.load(
-            fn=load_voices_on_start,
-            outputs=[voice_selector],
+        mic_audio.clear(
+            fn=lambda: (None, ""),
+            inputs=[],
+            outputs=[output_audio, response_toast],
+        )
+
+        sms_btn.click(
+            fn=on_sms,
+            inputs=[sms_input, voice_dd, style_dd],
+            outputs=[output_audio, response_toast],
+        )
+        sms_input.submit(
+            fn=on_sms,
+            inputs=[sms_input, voice_dd, style_dd],
+            outputs=[output_audio, response_toast],
+        )
+
+        read_btn.click(
+            fn=on_read,
+            inputs=[read_input, voice_dd],
+            outputs=[output_audio, response_toast],
+        )
+        read_input.submit(
+            fn=on_read,
+            inputs=[read_input, voice_dd],
+            outputs=[output_audio, response_toast],
         )
 
     return demo
@@ -331,9 +593,10 @@ def create_demo():
 
 if __name__ == "__main__":
     demo = create_demo()
-    demo.queue(max_size=20)
+    demo.queue(default_concurrency_limit=20)
     demo.launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
         share=True,
+        theme=gr.themes.Soft(),
     )

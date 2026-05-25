@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VoiceClone Waveform Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #fafaf7;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #1a1a1a;
+  }
+
+  .container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 40px;
+    padding: 60px 40px;
+  }
+
+  .waveform-wrapper {
+    position: relative;
+    width: 400px;
+    height: 130px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  canvas {
+    width: 400px;
+    height: 130px;
+    display: block;
+  }
+
+  .status {
+    font-size: 13px;
+    color: #999;
+    height: 20px;
+  }
+
+  .controls {
+    display: flex;
+    gap: 12px;
+  }
+
+  button {
+    padding: 9px 24px;
+    border: 1px solid #d0d0d0;
+    background: #fff;
+    color: #1a1a1a;
+    font-size: 13px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  button:hover {
+    background: #f0f0f0;
+    border-color: #b0b0b0;
+  }
+
+  button.active {
+    background: #1a1a1a;
+    color: #fff;
+    border-color: #1a1a1a;
+  }
+
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .slider-row label {
+    font-size: 13px;
+    color: #888;
+    min-width: 50px;
+    text-align: right;
+  }
+
+  input[type=range] {
+    width: 180px;
+    accent-color: #1a1a1a;
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="waveform-wrapper">
+    <canvas id="waveform"></canvas>
+  </div>
+
+  <div class="status" id="status">静默 — 轻微呼吸感</div>
+
+  <div class="slider-row">
+    <label>音量</label>
+    <input type="range" id="volume-slider" min="0" max="100" value="0" oninput="onVolumeInput(this.value)">
+  </div>
+
+  <div class="controls">
+    <button id="btn-auto" class="active" onclick="toggleAuto(this)">自动演示</button>
+    <button id="btn-idle" onclick="clickSilent(this)">静默</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('waveform');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const slider = document.getElementById('volume-slider');
+
+const BAR_COUNT = 45;
+const DPR = window.devicePixelRatio || 1;
+
+function resize() {
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * DPR;
+  canvas.height = rect.height * DPR;
+  ctx.scale(DPR, DPR);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// --- per-bar randomness ---
+const phases = Array.from({length: BAR_COUNT}, () => Math.random() * Math.PI * 2);
+const speeds = Array.from({length: BAR_COUNT}, () => 0.5 + Math.random() * 1.2);
+
+// --- continuous volume target ---
+let targetVolume = 0;        // 0=breath, 1=loud
+let currentVolume = 0;       // smoothly lerps toward targetVolume
+
+const BREATH_AMP = 0.055;    // idle breathing amplitude
+const SPEAK_AMP = 0.70;      // full speaking amplitude
+const VOLUME_LERP = 0.08;    // how fast volume transitions (lower = smoother)
+
+// --- auto demo mode ---
+let autoMode = true;
+let autoTime = 0;
+// Simulated speech bursts: [start_time, duration]
+const speechBursts = [
+  { start: 0.5,  dur: 0.8, amp: 0.7 },
+  { start: 1.6,  dur: 0.5, amp: 0.55 },
+  { start: 2.4,  dur: 1.2, amp: 0.85 },
+  { start: 4.0,  dur: 0.6, amp: 0.6 },
+  { start: 5.0,  dur: 0.4, amp: 0.75 },
+  { start: 5.8,  dur: 0.9, amp: 0.9 },
+  { start: 7.0,  dur: 0.3, amp: 0.5 },
+  // long pause after
+  { start: 9.0,  dur: 0.7, amp: 0.65 },
+  { start: 10.0, dur: 0.55, amp: 0.8 },
+  { start: 10.8, dur: 0.35, amp: 0.55 },
+  { start: 11.45, dur: 0.5, amp: 0.7 },
+  { start: 12.2, dur: 0.85, amp: 0.9 },
+  { start: 13.4, dur: 0.25, amp: 0.6 },
+  { start: 14.0, dur: 1.0, amp: 0.75 },
+  { start: 15.3, dur: 0.45, amp: 0.85 },
+  { start: 16.1, dur: 0.35, amp: 0.5 },
+  // end of sentence, long silence
+];
+const CYCLE_DURATION = 18.0; // seconds for one full cycle
+
+function getAutoVolume(timeInCycle) {
+  for (const burst of speechBursts) {
+    if (timeInCycle >= burst.start && timeInCycle <= burst.start + burst.dur) {
+      const progress = (timeInCycle - burst.start) / burst.dur;
+      // Attack/release envelope (smooth fade in/out within the burst)
+      let envelope;
+      if (progress < 0.12) {
+        envelope = progress / 0.12;                    // attack
+      } else if (progress > 0.82) {
+        envelope = (1 - progress) / 0.18;              // release
+      } else {
+        envelope = 1.0;                                 // sustain
+      }
+      return burst.amp * envelope;
+    }
+  }
+  return 0; // silence between bursts
+}
+
+function onVolumeInput(val) {
+  targetVolume = val / 100;
+  slider.value = val;
+  if (targetVolume > 0.01) autoMode = false;
+  updateButtons();
+}
+
+function clickSilent(btn) {
+  autoMode = false;
+  targetVolume = 0;
+  slider.value = 0;
+  updateButtons();
+}
+
+function toggleAuto(btn) {
+  autoMode = !autoMode;
+  if (autoMode) {
+    targetVolume = 0;
+    slider.value = 0;
+  }
+  updateButtons();
+}
+
+function updateButtons() {
+  document.getElementById('btn-auto').classList.toggle('active', autoMode);
+  document.getElementById('btn-idle').classList.toggle('active', !autoMode && targetVolume < 0.01);
+}
+
+let time = 0;
+
+function draw() {
+  requestAnimationFrame(draw);
+  const dt = 0.016;
+  time += dt;
+  autoTime += dt;
+  if (autoTime >= CYCLE_DURATION) autoTime -= CYCLE_DURATION;
+
+  // update target volume
+  if (autoMode) {
+    targetVolume = getAutoVolume(autoTime);
+  }
+
+  // smooth interpolation
+  currentVolume += (targetVolume - currentVolume) * VOLUME_LERP;
+
+  // derive visual amplitude: blend between breath and full speak
+  const visualAmp = BREATH_AMP + (SPEAK_AMP - BREATH_AMP) * currentVolume;
+
+  // --- draw ---
+  const W = canvas.width / DPR;
+  const H = canvas.height / DPR;
+  const CY = H / 2;
+  const barWidth = W / BAR_COUNT * 0.50;
+  const gap = W / BAR_COUNT * 0.50;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // baseline
+  ctx.strokeStyle = '#e8e8e3';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, CY);
+  ctx.lineTo(W, CY);
+  ctx.stroke();
+
+  // bars
+  for (let i = 0; i < BAR_COUNT; i++) {
+    const x = i * (barWidth + gap) + gap / 2;
+
+    const t = time * speeds[i];
+    const organic = Math.sin(t * 2.5 + phases[i]);
+    const noise = (Math.sin(t * 5.1 + phases[i] * 1.7) * 0.4 +
+                   Math.sin(t * 9.3 + phases[i] * 0.9) * 0.25 +
+                   Math.sin(t * 15.7 + phases[i] * 0.4) * 0.15);
+
+    const vibrato = Math.sin(i * 0.3 + time * 0.4) * 0.06 * currentVolume;
+
+    // Blend: breathing baseline always present, speaking adds on top
+    const breathe = organic * 0.045 + noise * 0.012;
+    const speak = (organic * 0.55 + noise * 0.22 + vibrato) * currentVolume;
+    const amplitude = breathe + speak;
+
+    const halfH = Math.abs(amplitude) * H * 0.45;
+    const top = CY - halfH;
+    const bot = CY + halfH;
+    const h = Math.max(bot - top, 1.5);
+
+    const distFromCenter = Math.abs(i - BAR_COUNT / 2) / (BAR_COUNT / 2);
+    const alpha = 0.6 - distFromCenter * 0.35;
+
+    ctx.fillStyle = `rgba(40, 40, 40, ${alpha})`;
+
+    const radius = barWidth * 0.45;
+    ctx.beginPath();
+    ctx.moveTo(x, top + radius);
+    ctx.arcTo(x, top, x + barWidth, top, radius);
+    ctx.arcTo(x + barWidth, top, x + barWidth, bot, radius);
+    ctx.arcTo(x + barWidth, bot, x, bot, radius);
+    ctx.arcTo(x, bot, x, top, radius);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // status text
+  if (autoMode && currentVolume < 0.04) {
+    statusEl.textContent = '静默 — 轻微呼吸感';
+  } else if (autoMode && currentVolume < 0.3) {
+    statusEl.textContent = '讲话中...';
+  } else if (autoMode) {
+    statusEl.textContent = '讲话中...';
+  } else if (currentVolume < 0.04) {
+    statusEl.textContent = '静默 — 轻微呼吸感';
+  } else {
+    statusEl.textContent = `音量 ${Math.round(currentVolume * 100)}%`;
+  }
+}
+
+draw();
+</script>
+</body>
+</html>
