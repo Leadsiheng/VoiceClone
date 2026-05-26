@@ -87,12 +87,14 @@ def _save_audio(audio_tensor, sample_rate: int) -> str:
 
 def process(data_json: str):
     if not data_json or not data_json.strip():
-        return None, ""
+        yield None, "", ""
+        return
 
     try:
         data = json.loads(data_json)
     except json.JSONDecodeError:
-        return None, ""
+        yield None, "", ""
+        return
 
     mode = data.get("mode", "")
     voice = data.get("voice", "")
@@ -103,48 +105,59 @@ def process(data_json: str):
     try:
         vid = _voice_id(voice)
         if not vid:
-            return None, f"未找到声音: {voice}，请先添加声音样本到 voices/ 目录"
+            yield None, f"未找到声音: {voice}", "未找到声音"
+            return
 
         if mode == "语音聊天":
             if not audio_path_input:
-                return None, "未收到录音。"
+                yield None, "未收到录音。", ""
+                return
+            yield None, "", "已收到语音，正在识别..."
             asr_engine = _get_asr()
             transcript = asr_engine.recognize(audio_path_input)
             if not transcript:
-                return None, "未检测到语音内容。"
+                yield None, "未检测到语音内容。", ""
+                return
+            yield None, "", "DeepSeek 正在回复..."
             llm = _get_llm()
             prompt = get_style_prompt(style)
             reply = llm.chat(transcript, prompt)
+            yield None, "", "正在生成音频..."
             tts = _get_tts()
             audio = tts.synthesize(reply, vid)
             audio_file = _save_audio(audio, tts.sample_rate)
-            return audio_file, reply
+            yield audio_file, reply, ""
 
         elif mode == "发送短信":
             if not text.strip():
-                return None, "请输入消息。"
+                yield None, "请输入消息。", ""
+                return
+            yield None, "", "DeepSeek 正在回复..."
             llm = _get_llm()
             prompt = get_style_prompt(style)
             reply = llm.chat(text, prompt)
+            yield None, "", "正在生成音频..."
             tts = _get_tts()
             audio = tts.synthesize(reply, vid)
             audio_file = _save_audio(audio, tts.sample_rate)
-            return audio_file, reply
+            yield audio_file, reply, ""
 
         elif mode == "朗读内容":
             if not text.strip():
-                return None, "请输入朗读文字。"
+                yield None, "请输入朗读文字。", ""
+                return
+            yield None, "", "正在生成音频..."
             tts = _get_tts()
             audio = tts.synthesize(text, vid)
             audio_file = _save_audio(audio, tts.sample_rate)
-            return audio_file, text
+            yield audio_file, text, ""
 
         else:
-            return None, f"未知模式: {mode}"
+            yield None, f"未知模式: {mode}", ""
 
     except Exception as e:
         traceback.print_exc()
-        return None, f"错误: {e}"
+        yield None, f"错误: {e}", ""
 
 
 # ── HTML (structure only) ──
@@ -153,9 +166,10 @@ HTML_UI = """
   <div id="waveform-wrap" style="width:100%;height:300px;position:relative;margin-bottom:2px;">
     <canvas id="waveform-canvas" style="width:100%;height:300px;display:block;"></canvas>
   </div>
-  <div style="display:flex;justify-content:center;margin-bottom:210px;">
+  <div style="display:flex;justify-content:center;margin-bottom:6px;">
     <select id="voice-dd" style="padding:2px 26px 2px 8px;border:1px solid #eaeae4;border-radius:4px;background:#f7f7f4;color:#a0a0a0;font-size:11px;cursor:pointer;outline:none;appearance:none;text-align:center;letter-spacing:0.5px;min-width:80px;background-image:url(&quot;data:image/svg+xml,%3Csvg width='7' height='4' viewBox='0 0 7 4' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L3.5 3L6 1' stroke='%23aaa' stroke-width='1' stroke-linecap='round'/%3E%3C/svg%3E&quot;);background-repeat:no-repeat;background-position:right 6px center;">%VOICE_OPTIONS%</select>
   </div>
+  <div id="status-line" style="font-size:12px;color:#bbb;text-align:center;min-height:18px;margin-bottom:190px;"></div>
   <div style="display:flex;flex-direction:row;align-items:center;justify-content:center;gap:20px;margin-bottom:40px;flex-wrap:nowrap;">
     <div id="mode-tabs" style="display:flex;flex-direction:row;align-items:stretch;gap:4px;background:#eee;border-radius:10px;padding:3px;flex-shrink:0;">
       <button id="tab-voice" class="mode-tab active" data-mode="voice" style="min-width:110px;height:38px;border-radius:8px;font-size:14px;font-weight:500;font-family:inherit;color:#1a1a1a;cursor:pointer;border:none;outline:none;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,0.06);white-space:nowrap;padding:0 22px;display:inline-flex;align-items:center;justify-content:center;transition:all 0.2s;">语音聊天</button>
@@ -221,6 +235,8 @@ JS_CODE = """
     });
 
     function sendToPython(payload) {
+      document.getElementById('status-line').textContent = '';
+      document.getElementById('status-line').style.opacity = '0';
       var hidden = document.querySelector('#hidden-request textarea, #hidden-request input');
       if (!hidden) return;
       var desc = hidden.tagName === 'INPUT'
@@ -303,6 +319,19 @@ JS_CODE = """
           : Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
         desc.set.call(el,''); el.dispatchEvent(new Event('input',{bubbles:true}));
       }
+
+      var st = document.querySelector('#hidden-status textarea, #hidden-status input');
+      if (st && st.value) {
+        var statusLine = document.getElementById('status-line');
+        var newStatus = st.value;
+        statusLine.textContent = newStatus;
+        statusLine.style.opacity = newStatus ? '1' : '0';
+        var sdesc = st.tagName==='INPUT'
+          ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')
+          : Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
+        sdesc.set.call(st,''); st.dispatchEvent(new Event('input',{bubbles:true}));
+      }
+
       requestAnimationFrame(function(){ setTimeout(checkResponse, 300); });
     }
     setTimeout(checkResponse, 500);
@@ -415,13 +444,14 @@ def create_demo():
 
         hidden_request = gr.Textbox(value="", visible=False, elem_id="hidden-request", show_label=False)
         hidden_response = gr.Textbox(value="", visible=False, elem_id="hidden-response", show_label=False)
+        hidden_status = gr.Textbox(value="", visible=False, elem_id="hidden-status", show_label=False)
         output_audio = gr.Audio(autoplay=True, visible=False, show_label=False, elem_id="hidden-audio")
         mic_audio = gr.Audio(sources=["microphone"], type="filepath", visible=False, elem_id="mic-trigger", show_label=False)
 
         hidden_request.change(
             fn=process,
             inputs=[hidden_request],
-            outputs=[output_audio, hidden_response],
+            outputs=[output_audio, hidden_response, hidden_status],
         )
 
         def on_mic_stop(audio_path):
@@ -443,6 +473,16 @@ def create_demo():
 
 
 if __name__ == "__main__":
+    # Warm up TTS bridge before starting server (~60s on M5 Mac)
+    import threading, sys
+    print("正在加载 TTS 模型，请稍候...", flush=True)
+    try:
+        _get_tts()
+        print("TTS 模型就绪！", flush=True)
+    except Exception as e:
+        print(f"TTS 加载警告: {e}", flush=True)
+        print("将在首次使用时加载。", flush=True)
+
     demo = create_demo()
     demo.queue(default_concurrency_limit=20)
     demo.launch(
