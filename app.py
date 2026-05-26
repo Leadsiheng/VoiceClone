@@ -1,10 +1,11 @@
 """
-VoiceClone — Zero-shot voice cloning + conversational AI.
-New UI matching prototype design.
+VoiceClone — Production backend with IndexTTS2 + DeepSeek + FunASR.
+UI matches prototype: HTML structure + JS in head.
 """
+import json
 import os
 import tempfile
-import time
+import traceback
 import warnings
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
-from prompts import STYLES, DEFAULT_STYLE, get_style_prompt, get_style_list
+from prompts import get_style_prompt, get_style_list
 
 warnings.filterwarnings("ignore")
 
@@ -84,508 +85,358 @@ def _save_audio(audio_tensor, sample_rate: int) -> str:
     return tmp.name
 
 
-# ── Callbacks ──
-
-def on_mode_change(mode: str):
-    is_chat = mode in ("语音聊天", "发送短信")
-    return (
-        gr.Column(visible=(mode == "语音聊天")),
-        gr.Column(visible=(mode == "发送短信")),
-        gr.Column(visible=(mode == "朗读内容")),
-        gr.Dropdown(visible=is_chat),
-    )
-
-
-def on_voice_chat(audio_path: str, voice_name: str, style_name: str):
-    if audio_path is None:
+def process(data_json: str):
+    if not data_json or not data_json.strip():
         return None, ""
 
-    tts = _get_tts()
-    llm = _get_llm()
-    asr_engine = _get_asr()
-    vid = _voice_id(voice_name)
-
-    if not vid:
-        return None, f"未找到声音: {voice_name}"
-
-    transcript = asr_engine.recognize(audio_path)
-    if not transcript:
-        return None, "未检测到语音。"
-
-    prompt = get_style_prompt(style_name)
     try:
-        reply = llm.chat(transcript, prompt)
-    except Exception as e:
-        return None, f"LLM 错误: {e}"
-
-    try:
-        audio = tts.synthesize(reply, vid)
-        audio_path_out = _save_audio(audio, tts.sample_rate)
-        return audio_path_out, f"「{reply}」"
-    except Exception as e:
-        return None, f"TTS 错误: {e}"
-
-
-def on_sms(text: str, voice_name: str, style_name: str):
-    if not text.strip():
+        data = json.loads(data_json)
+    except json.JSONDecodeError:
         return None, ""
 
-    tts = _get_tts()
-    llm = _get_llm()
-    vid = _voice_id(voice_name)
-
-    if not vid:
-        return None, f"未找到声音: {voice_name}"
-
-    prompt = get_style_prompt(style_name)
-    try:
-        reply = llm.chat(text, prompt)
-    except Exception as e:
-        return None, f"LLM 错误: {e}"
+    mode = data.get("mode", "")
+    voice = data.get("voice", "")
+    style = data.get("style", "")
+    text = data.get("text", "")
+    audio_path_input = data.get("audio_path", "")
 
     try:
-        audio = tts.synthesize(reply, vid)
-        audio_path_out = _save_audio(audio, tts.sample_rate)
-        return audio_path_out, f"「{reply}」"
+        vid = _voice_id(voice)
+        if not vid:
+            return None, f"未找到声音: {voice}，请先添加声音样本到 voices/ 目录"
+
+        if mode == "语音聊天":
+            if not audio_path_input:
+                return None, "未收到录音。"
+            asr_engine = _get_asr()
+            transcript = asr_engine.recognize(audio_path_input)
+            if not transcript:
+                return None, "未检测到语音内容。"
+            llm = _get_llm()
+            prompt = get_style_prompt(style)
+            reply = llm.chat(transcript, prompt)
+            tts = _get_tts()
+            audio = tts.synthesize(reply, vid)
+            audio_file = _save_audio(audio, tts.sample_rate)
+            return audio_file, reply
+
+        elif mode == "发送短信":
+            if not text.strip():
+                return None, "请输入消息。"
+            llm = _get_llm()
+            prompt = get_style_prompt(style)
+            reply = llm.chat(text, prompt)
+            tts = _get_tts()
+            audio = tts.synthesize(reply, vid)
+            audio_file = _save_audio(audio, tts.sample_rate)
+            return audio_file, reply
+
+        elif mode == "朗读内容":
+            if not text.strip():
+                return None, "请输入朗读文字。"
+            tts = _get_tts()
+            audio = tts.synthesize(text, vid)
+            audio_file = _save_audio(audio, tts.sample_rate)
+            return audio_file, text
+
+        else:
+            return None, f"未知模式: {mode}"
+
     except Exception as e:
-        return None, f"TTS 错误: {e}"
+        traceback.print_exc()
+        return None, f"错误: {e}"
 
 
-def on_read(text: str, voice_name: str):
-    if not text.strip():
-        return None, ""
-
-    tts = _get_tts()
-    vid = _voice_id(voice_name)
-
-    if not vid:
-        return None, f"未找到声音: {voice_name}"
-
-    try:
-        audio = tts.synthesize(text, vid)
-        audio_path_out = _save_audio(audio, tts.sample_rate)
-        return audio_path_out, f"朗读:「{text}」"
-    except Exception as e:
-        return None, f"TTS 错误: {e}"
-
-
-# ── Waveform HTML + JS (Web Audio API driven) ──
-
-WAVEFORM_HTML = """
-<div id="waveform-wrap" style="width:100%;height:260px;position:relative;margin-bottom:6px;">
-  <canvas id="waveform-canvas" style="width:100%;height:260px;display:block;"></canvas>
+# ── HTML (structure only) ──
+HTML_UI = """
+<div id="app-root" style="width:100%;max-width:1100px;margin:0 auto;padding:50px 60px 40px;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;">
+  <div id="waveform-wrap" style="width:100%;height:300px;position:relative;margin-bottom:2px;">
+    <canvas id="waveform-canvas" style="width:100%;height:300px;display:block;"></canvas>
+  </div>
+  <div style="display:flex;justify-content:center;margin-bottom:210px;">
+    <select id="voice-dd" style="padding:2px 26px 2px 8px;border:1px solid #eaeae4;border-radius:4px;background:#f7f7f4;color:#a0a0a0;font-size:11px;cursor:pointer;outline:none;appearance:none;text-align:center;letter-spacing:0.5px;min-width:80px;background-image:url(&quot;data:image/svg+xml,%3Csvg width='7' height='4' viewBox='0 0 7 4' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L3.5 3L6 1' stroke='%23aaa' stroke-width='1' stroke-linecap='round'/%3E%3C/svg%3E&quot;);background-repeat:no-repeat;background-position:right 6px center;">%VOICE_OPTIONS%</select>
+  </div>
+  <div style="display:flex;flex-direction:row;align-items:center;justify-content:center;gap:20px;margin-bottom:40px;flex-wrap:nowrap;">
+    <div id="mode-tabs" style="display:flex;flex-direction:row;align-items:stretch;gap:4px;background:#eee;border-radius:10px;padding:3px;flex-shrink:0;">
+      <button id="tab-voice" class="mode-tab active" data-mode="voice" style="min-width:110px;height:38px;border-radius:8px;font-size:14px;font-weight:500;font-family:inherit;color:#1a1a1a;cursor:pointer;border:none;outline:none;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,0.06);white-space:nowrap;padding:0 22px;display:inline-flex;align-items:center;justify-content:center;transition:all 0.2s;">语音聊天</button>
+      <button id="tab-sms" class="mode-tab" data-mode="sms" style="min-width:110px;height:38px;border-radius:8px;font-size:14px;font-weight:400;font-family:inherit;color:#aaa;cursor:pointer;border:none;outline:none;background:transparent;white-space:nowrap;padding:0 22px;display:inline-flex;align-items:center;justify-content:center;transition:all 0.2s;">发送短信</button>
+      <button id="tab-read" class="mode-tab" data-mode="read" style="min-width:110px;height:38px;border-radius:8px;font-size:14px;font-weight:400;font-family:inherit;color:#aaa;cursor:pointer;border:none;outline:none;background:transparent;white-space:nowrap;padding:0 22px;display:inline-flex;align-items:center;justify-content:center;transition:all 0.2s;">朗读内容</button>
+    </div>
+    <select id="style-dd" style="padding:7px 30px 7px 14px;border:1px solid #e6e6e0;border-radius:8px;background:#f7f7f4;color:#999;font-size:13px;cursor:pointer;outline:none;appearance:none;min-width:150px;text-align:center;background-image:url(&quot;data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='%23aaa' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E&quot;);background-repeat:no-repeat;background-position:right 12px center;">%STYLE_OPTIONS%</select>
+  </div>
+  <div id="panel-voice" class="mode-panel" style="display:flex;flex-direction:column;align-items:center;gap:18px;width:100%;">
+    <button id="mic-btn" style="width:96px;height:96px;border-radius:50%;border:2px solid #e4e4de;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.25s;box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+      <svg id="mic-icon" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="1.8" stroke-linecap="round"><rect x="8" y="2" width="8" height="13" rx="4"/><path d="M4 11a8 8 0 0 0 16 0"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+    </button>
+  </div>
+  <div id="panel-sms" class="mode-panel" style="display:none;flex-direction:column;align-items:center;gap:18px;width:100%;">
+    <div style="display:flex;gap:14px;width:80%;max-width:650px;align-items:center;"><div style="flex:1;"><input id="sms-input" type="text" placeholder="输入消息..." style="width:100%;padding:16px 22px;border:1px solid #e4e4de;border-radius:28px;background:#fff;color:#1a1a1a;font-size:16px;outline:none;box-sizing:border-box;box-shadow:0 1px 4px rgba(0,0,0,0.03);"></div>
+    <button id="sms-send-btn" style="width:50px;height:50px;border-radius:50%;border:1px solid #e4e4de;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.2s;box-shadow:0 1px 4px rgba(0,0,0,0.03);"><svg id="sms-send-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22,2 15,22 11,13 2,9"/></svg></button></div>
+  </div>
+  <div id="panel-read" class="mode-panel" style="display:none;flex-direction:column;align-items:center;gap:18px;width:100%;">
+    <div style="display:flex;gap:14px;width:80%;max-width:650px;align-items:center;"><div style="flex:1;"><input id="read-input" type="text" placeholder="输入要朗读的文字..." style="width:100%;padding:16px 22px;border:1px solid #e4e4de;border-radius:28px;background:#fff;color:#1a1a1a;font-size:16px;outline:none;box-sizing:border-box;box-shadow:0 1px 4px rgba(0,0,0,0.03);"></div>
+    <button id="read-send-btn" style="width:50px;height:50px;border-radius:50%;border:1px solid #e4e4de;background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.2s;box-shadow:0 1px 4px rgba(0,0,0,0.03);"><svg id="read-send-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22,2 15,22 11,13 2,9"/></svg></button></div>
+  </div>
+  <div id="response-toast" style="font-size:14px;color:#aaa;text-align:center;padding:6px 0;min-height:24px;margin-top:18px;opacity:0;transition:opacity 0.3s;"></div>
 </div>
+"""
 
+
+JS_CODE = """
 <script>
-(function(){
-const canvas = document.getElementById('waveform-canvas');
-const ctx = canvas.getContext('2d');
-const BAR_COUNT = 45;
-const DPR = window.devicePixelRatio || 1;
+(function() {
+  var obs = new MutationObserver(function(m, o) {
+    var root = document.getElementById('app-root');
+    if (!root || !root.offsetParent) return;
+    o.disconnect();
+    initApp();
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
 
-function resizeWave() {
-  const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * DPR;
-  canvas.height = rect.height * DPR;
-  ctx.scale(DPR, DPR);
-}
-resizeWave();
-new ResizeObserver(resizeWave).observe(canvas.parentElement);
+  function initApp() {
+    var currentMode = 'voice';
+    var recording = false;
+    var toastTimer = null;
 
-const phases = Array.from({length:BAR_COUNT},()=>Math.random()*Math.PI*2);
-const speeds = Array.from({length:BAR_COUNT},()=>0.5+Math.random()*1.2);
-
-// State
-let targetVolume = 0;
-let currentVolume = 0;
-const BREATH_AMP = 0.055;
-const SPEAK_AMP = 0.75;
-const VOLUME_LERP = 0.06;
-
-// Audio analyser
-let audioCtx = null;
-let analyser = null;
-let freqData = null;
-let isPlaying = false;
-
-function setupAudioContext() {
-  // Find Gradio's audio element
-  const audios = document.querySelectorAll('audio');
-  for (const audio of audios) {
-    if (audio.dataset.waveformHooked) continue;
-    audio.dataset.waveformHooked = '1';
-
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 128;
-      analyser.smoothingTimeConstant = 0.5;
-      freqData = new Uint8Array(analyser.frequencyBinCount);
-    }
-
-    try {
-      const source = audioCtx.createMediaElementSource(audio);
-      source.connect(analyser);
-      analyser.connect(audioCtx.destination);
-    } catch(e) { /* already connected */ }
-
-    audio.addEventListener('play', () => {
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      isPlaying = true;
+    var tabs = document.querySelectorAll('.mode-tab');
+    tabs.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var mode = this.dataset.mode;
+        currentMode = mode;
+        tabs.forEach(function(t) {
+          t.style.background = 'transparent';
+          t.style.color = '#aaa';
+          t.style.boxShadow = 'none';
+          t.style.fontWeight = '400';
+        });
+        this.style.background = '#fff';
+        this.style.color = '#1a1a1a';
+        this.style.fontWeight = '500';
+        this.style.boxShadow = '0 1px 3px rgba(0,0,0,0.06)';
+        document.getElementById('panel-voice').style.display = mode==='voice'?'flex':'none';
+        document.getElementById('panel-sms').style.display = mode==='sms'?'flex':'none';
+        document.getElementById('panel-read').style.display = mode==='read'?'flex':'none';
+        document.getElementById('style-dd').style.visibility = mode==='read'?'hidden':'visible';
+      });
     });
-    audio.addEventListener('ended', () => { isPlaying = false; });
-    audio.addEventListener('pause', () => { isPlaying = false; });
-  }
-}
 
-let time = 0;
-function drawWave() {
-  requestAnimationFrame(drawWave);
-  const dt = 0.016;
-  time += dt;
-
-  // Periodically check for new audio elements
-  if (Math.floor(time * 10) % 20 === 0) setupAudioContext();
-
-  // Get live volume from analyser if playing
-  let liveVol = 0;
-  if (isPlaying && analyser && freqData) {
-    analyser.getByteFrequencyData(freqData);
-    let sum = 0;
-    for (let i = 0; i < freqData.length; i++) sum += freqData[i];
-    liveVol = (sum / freqData.length) / 255;
-    liveVol = Math.pow(liveVol, 0.6); // perceptual curve
-  }
-
-  // Blend target: live audio volume when playing, 0 when not
-  targetVolume = liveVol > 0.02 ? liveVol : 0;
-  currentVolume += (targetVolume - currentVolume) * VOLUME_LERP;
-
-  const W = canvas.width / DPR;
-  const H = canvas.height / DPR;
-  const CY = H / 2;
-  const barW = W / BAR_COUNT * 0.50;
-  const gap = W / BAR_COUNT * 0.50;
-
-  ctx.clearRect(0, 0, W, H);
-
-  // Baseline
-  ctx.strokeStyle = '#e8e8e3';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(0, CY);
-  ctx.lineTo(W, CY);
-  ctx.stroke();
-
-  for (let i = 0; i < BAR_COUNT; i++) {
-    const x = i * (barW + gap) + gap / 2;
-    const t = time * speeds[i];
-    const organic = Math.sin(t * 2.5 + phases[i]);
-    const noise = Math.sin(t * 5.1 + phases[i] * 1.7) * 0.4 +
-                  Math.sin(t * 9.3 + phases[i] * 0.9) * 0.25 +
-                  Math.sin(t * 15.7 + phases[i] * 0.4) * 0.15;
-    const vibrato = Math.sin(i * 0.3 + time * 0.4) * 0.06 * currentVolume;
-
-    // Map bar to frequency bin for live audio
-    let liveBar = 0;
-    if (liveVol > 0.02 && freqData) {
-      const binIdx = Math.floor(i / BAR_COUNT * freqData.length);
-      liveBar = (freqData[binIdx] || 0) / 255;
-      liveBar = Math.pow(liveBar, 0.6);
+    function sendToPython(payload) {
+      var hidden = document.querySelector('#hidden-request textarea, #hidden-request input');
+      if (!hidden) return;
+      var desc = hidden.tagName === 'INPUT'
+        ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+        : Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+      desc.set.call(hidden, '');
+      hidden.dispatchEvent(new Event('input',{bubbles:true}));
+      setTimeout(function() {
+        desc.set.call(hidden, JSON.stringify(payload));
+        hidden.dispatchEvent(new Event('input',{bubbles:true}));
+        hidden.dispatchEvent(new Event('change',{bubbles:true}));
+        hidden.dispatchEvent(new Event('blur',{bubbles:true}));
+      }, 100);
     }
 
-    const breathe = organic * 0.045 + noise * 0.012;
-    const speakLive = liveBar * 0.65 + organic * 0.15 * liveVol;
-    const speak = currentVolume > 0.05 ? speakLive : (organic * 0.55 + noise * 0.22 + vibrato) * currentVolume;
-    const amplitude = breathe + speak;
+    document.getElementById('mic-btn').addEventListener('click', function() {
+      recording = !recording;
+      var btn = document.getElementById('mic-btn');
+      var icon = document.getElementById('mic-icon');
+      if (recording) {
+        btn.style.borderColor = '#e04545'; btn.style.background = '#fef5f5';
+        btn.style.boxShadow = '0 2px 12px rgba(224,69,69,0.15)';
+        icon.style.stroke = '#e04545';
+        // Trigger hidden mic recorder
+        var micTrigger = document.querySelector('#mic-trigger audio') || document.querySelector('#mic-trigger button');
+        if (micTrigger) micTrigger.click();
+      } else {
+        btn.style.borderColor = '#e4e4de'; btn.style.background = '#fff';
+        btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.04)';
+        icon.style.stroke = '#333';
+        // Audio will be processed by Gradio's stop_recording event
+      }
+    });
 
-    const halfH = Math.abs(amplitude) * H * 0.45;
-    const top = CY - halfH;
-    const bot = CY + halfH;
+    document.getElementById('sms-send-btn').addEventListener('click', function() {
+      var input = document.getElementById('sms-input');
+      var text = input.value.trim(); if(!text) return;
+      sendToPython({mode:'发送短信', voice: document.getElementById('voice-dd').value, style: document.getElementById('style-dd').value, text:text});
+      input.value = '';
+    });
+    document.getElementById('sms-input').addEventListener('keydown', function(e) {
+      if(e.key==='Enter') document.getElementById('sms-send-btn').click();
+    });
 
-    const dist = Math.abs(i - BAR_COUNT / 2) / (BAR_COUNT / 2);
-    const alpha = 0.6 - dist * 0.35;
+    document.getElementById('read-send-btn').addEventListener('click', function() {
+      var input = document.getElementById('read-input');
+      var text = input.value.trim(); if(!text) return;
+      sendToPython({mode:'朗读内容', voice: document.getElementById('voice-dd').value, style:'', text:text});
+      input.value = '';
+    });
+    document.getElementById('read-input').addEventListener('keydown', function(e) {
+      if(e.key==='Enter') document.getElementById('read-send-btn').click();
+    });
 
-    ctx.fillStyle = `rgba(40,40,40,${alpha})`;
-    const r = barW * 0.45;
-    ctx.beginPath();
-    ctx.moveTo(x, top + r);
-    ctx.arcTo(x, top, x + barW, top, r);
-    ctx.arcTo(x + barW, top, x + barW, bot, r);
-    ctx.arcTo(x + barW, bot, x, bot, r);
-    ctx.arcTo(x, bot, x, top, r);
-    ctx.closePath();
-    ctx.fill();
+    ['sms-send-btn','read-send-btn'].forEach(function(id) {
+      var b = document.getElementById(id);
+      var iconId = id === 'sms-send-btn' ? 'sms-send-icon' : 'read-send-icon';
+      b.addEventListener('mouseenter', function() {
+        this.style.background='#1a1a1a';this.style.borderColor='#1a1a1a';
+        this.style.boxShadow='0 2px 10px rgba(0,0,0,0.15)';
+        document.getElementById(iconId).style.stroke='#fff';
+      });
+      b.addEventListener('mouseleave', function() {
+        this.style.background='#fff';this.style.borderColor='#e4e4de';
+        this.style.boxShadow='0 1px 4px rgba(0,0,0,0.03)';
+        document.getElementById(iconId).style.stroke='#333';
+      });
+    });
+
+    function checkResponse() {
+      var el = document.querySelector('#hidden-response textarea, #hidden-response input');
+      if (el && el.value) {
+        var text = el.value;
+        var toast = document.getElementById('response-toast');
+        toast.textContent = text; toast.style.opacity = '1';
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function(){ toast.style.opacity='0'; }, 5000);
+        var desc = el.tagName==='INPUT'
+          ? Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')
+          : Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');
+        desc.set.call(el,''); el.dispatchEvent(new Event('input',{bubbles:true}));
+      }
+      requestAnimationFrame(function(){ setTimeout(checkResponse, 300); });
+    }
+    setTimeout(checkResponse, 500);
+
+    // Waveform
+    (function() {
+      var canvas = document.getElementById('waveform-canvas');
+      var ctx = canvas.getContext('2d');
+      var BAR_COUNT = 55;
+      var DPR = window.devicePixelRatio || 1;
+      function resizeWave() {
+        var rect = canvas.parentElement.getBoundingClientRect();
+        canvas.width = rect.width * DPR;
+        canvas.height = rect.height * DPR;
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      }
+      resizeWave();
+      new ResizeObserver(resizeWave).observe(canvas.parentElement);
+      var phases=[]; for(var i=0;i<BAR_COUNT;i++) phases.push(Math.random()*Math.PI*2);
+      var speeds=[]; for(var i=0;i<BAR_COUNT;i++) speeds.push(0.5+Math.random()*1.2);
+      var targetVolume=0, currentVolume=0;
+      var BREATH_AMP=0.05, SPEAK_AMP=0.8, VOLUME_LERP=0.05;
+      var audioCtx=null, analyser=null, freqData=null, isPlaying=false;
+      function setupAudioCtx() {
+        var audios = document.querySelectorAll('audio');
+        for(var a=0;a<audios.length;a++) {
+          var audio=audios[a];
+          if(audio.dataset.wf) continue;
+          audio.dataset.wf='1';
+          if(!audioCtx) {
+            audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize=256; analyser.smoothingTimeConstant=0.5;
+            freqData = new Uint8Array(analyser.frequencyBinCount);
+          }
+          try { var src=audioCtx.createMediaElementSource(audio); src.connect(analyser); analyser.connect(audioCtx.destination); } catch(e){}
+          audio.addEventListener('play', function(){ if(audioCtx.state==='suspended') audioCtx.resume(); isPlaying=true; });
+          audio.addEventListener('ended', function(){ isPlaying=false; });
+          audio.addEventListener('pause', function(){ isPlaying=false; });
+        }
+      }
+      var time=0;
+      function drawWave() {
+        requestAnimationFrame(drawWave); var dt=0.016; time+=dt;
+        if(Math.floor(time*10)%20===0) setupAudioCtx();
+        var liveVol=0;
+        if(isPlaying && analyser && freqData) {
+          analyser.getByteFrequencyData(freqData);
+          var sum=0; for(var i=0;i<freqData.length;i++) sum+=freqData[i];
+          liveVol=(sum/freqData.length)/255; liveVol=Math.pow(liveVol,0.55);
+        }
+        targetVolume=liveVol>0.015?liveVol:0;
+        currentVolume+=(targetVolume-currentVolume)*VOLUME_LERP;
+        var W=canvas.width/DPR, H=canvas.height/DPR, CY=H/2;
+        var barW=W/BAR_COUNT*0.55, gap=W/BAR_COUNT*0.45;
+        ctx.clearRect(0,0,W,H);
+        ctx.strokeStyle='#eaeae4'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(0,CY); ctx.lineTo(W,CY); ctx.stroke();
+        for(var i=0;i<BAR_COUNT;i++) {
+          var x=i*(barW+gap)+gap/2, t=time*speeds[i];
+          var organic=Math.sin(t*2.5+phases[i]);
+          var noise=Math.sin(t*5.1+phases[i]*1.7)*0.4+Math.sin(t*9.3+phases[i]*0.9)*0.25+Math.sin(t*15.7+phases[i]*0.4)*0.15;
+          var vibrato=Math.sin(i*0.3+time*0.4)*0.06*currentVolume;
+          var liveBar=0;
+          if(liveVol>0.015&&freqData){var binIdx=Math.floor(i/BAR_COUNT*freqData.length);liveBar=(freqData[binIdx]||0)/255;liveBar=Math.pow(liveBar,0.55);}
+          var breathe=organic*0.04+noise*0.01;
+          var speakLive=liveBar*0.7+organic*0.15*liveVol;
+          var speak=currentVolume>0.05?speakLive:(organic*0.55+noise*0.22+vibrato)*currentVolume;
+          var amplitude=breathe+speak;
+          var halfH=Math.abs(amplitude)*H*0.46, top=CY-halfH, bot=CY+halfH;
+          var dist=Math.abs(i-BAR_COUNT/2)/(BAR_COUNT/2);
+          var alpha=0.55-dist*0.32;
+          ctx.fillStyle='rgba(30,30,30,'+alpha+')';
+          var r=barW*0.45;
+          ctx.beginPath();ctx.moveTo(x,top+r);ctx.arcTo(x,top,x+barW,top,r);
+          ctx.arcTo(x+barW,top,x+barW,bot,r);ctx.arcTo(x+barW,bot,x,bot,r);
+          ctx.arcTo(x,bot,x,top,r);ctx.closePath();ctx.fill();
+        }
+      }
+      drawWave();
+    })();
   }
-}
-drawWave();
 })();
 </script>
 """
 
-# ── CSS ──
 
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500&display=swap');
-
-* { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif !important; }
-
+css = """
 body, .gradio-container { background: #fafaf7 !important; }
-
-/* Hide default footer */
 footer { display: none !important; }
-
-/* ── App container ── */
-.gradio-container { max-width: 680px !important; margin: 0 auto !important; }
-.contain { padding: 40px 40px 30px !important; }
-
-/* ── Voice dropdown (small, light, centered) ── */
-#voice-selector {
-  display: flex !important; justify-content: center !important;
-  margin-bottom: 242px !important; margin-top: 6px !important;
-}
-#voice-selector .wrap { max-width: 130px !important; }
-#voice-selector select, #voice-selector input[type="text"] {
-  background: #f6f6f3 !important; border: 1px solid #e8e8e2 !important;
-  color: #aaa !important; font-size: 12px !important;
-  padding: 4px 24px 4px 10px !important; border-radius: 6px !important;
-  text-align: center !important; letter-spacing: 0.5px !important;
-  min-height: auto !important; height: auto !important;
-}
-#voice-selector label { display: none !important; }
-
-/* ── Control row (mode tabs + style) ── */
-#control-row {
-  display: flex !important; align-items: center !important;
-  justify-content: center !important; gap: 16px !important;
-  margin-bottom: 36px !important;
-}
-
-/* ── Mode radio (pill style) ── */
-#mode-radio {
-  background: #ecece6 !important; border-radius: 9px !important;
-  padding: 3px !important; border: none !important;
-}
-#mode-radio .wrap { gap: 0 !important; }
-#mode-radio label {
-  padding: 8px 22px !important; border-radius: 7px !important;
-  font-size: 13px !important; color: #aaa !important;
-  cursor: pointer !important; background: transparent !important;
-  margin: 0 !important; border: none !important;
-  box-shadow: none !important;
-}
-#mode-radio label.selected {
-  background: #fff !important; color: #1a1a1a !important;
-  font-weight: 500 !important;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.05) !important;
-}
-#mode-radio input[type="radio"] { display: none !important; }
-
-/* ── Style dropdown ── */
-#style-selector .wrap { max-width: 150px !important; }
-#style-selector select, #style-selector input[type="text"] {
-  background: #f6f6f3 !important; border: 1px solid #e4e4dd !important;
-  color: #aaa !important; font-size: 12px !important;
-  padding: 6px 28px 6px 12px !important; border-radius: 8px !important;
-  text-align: center !important; min-height: auto !important;
-}
-#style-selector label { display: none !important; }
-
-/* ── Mic button (hidden, we use HTML) ── */
-#mic-audio { display: none !important; }
-
-/* ── Text input ── */
-#sms-input input, #read-input input {
-  padding: 14px 20px !important; border: 1px solid #e0e0da !important;
-  border-radius: 24px !important; background: #fff !important;
-  font-size: 15px !important; outline: none !important;
-}
-#sms-input input::placeholder, #read-input input::placeholder { color: #c8c8c2 !important; }
-#sms-input input:focus, #read-input input:focus { border-color: #b0b0b0 !important; }
-
-/* ── Send button ── */
-#sms-btn, #read-btn {
-  width: 48px !important; height: 48px !important; min-width: 48px !important;
-  border-radius: 50% !important; border: 1px solid #e0e0da !important;
-  background: #fff !important; cursor: pointer !important;
-  display: flex !important; align-items: center !important; justify-content: center !important;
-  font-size: 18px !important; padding: 0 !important;
-}
-#sms-btn:hover, #read-btn:hover {
-  background: #1a1a1a !important; border-color: #1a1a1a !important; color: #fff !important;
-}
-
-/* ── Response toast ── */
-#response-toast .prose { text-align: center !important; font-size: 14px !important;
-  color: #aaa !important; padding: 4px 0 !important; min-height: 22px !important; }
-#response-toast { margin-top: 14px !important; }
-
-/* ── Mic custom button ── */
-.mic-btn-wrap { display: flex; justify-content: center; }
-.mic-btn {
-  width: 88px; height: 88px; border-radius: 50%;
-  border: 2px solid #e0e0da; background: #fff;
-  cursor: pointer; display: flex; align-items: center;
-  justify-content: center; transition: all 0.25s;
-  position: relative; font-size: 24px; color: #1a1a1a;
-}
-.mic-btn:hover { border-color: #b0b0b0; background: #f4f4f2; }
-.mic-btn.recording {
-  border-color: #e04545; background: #fef5f5; color: #e04545;
-  animation: mic-pulse 1.2s ease-in-out infinite;
-}
-@keyframes mic-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(224,69,69,0.2); }
-  50% { box-shadow: 0 0 0 16px rgba(224,69,69,0.02); }
-}
-
-/* ── Hide Gradio default labels ── */
-#voice-chat-panel > label, #sms-panel > label, #read-panel > label { display: none !important; }
+.gradio-container { max-width: 100% !important; margin: 0 !important; padding: 0 !important; }
+#app-root * { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif !important; }
+.contain { padding: 0 !important; }
+.block.gradio-html { width: 100% !important; max-width: 100% !important; }
+.mode-tab { box-sizing: border-box !important; }
 """
 
 
 def create_demo():
-    style_list = get_style_list()
-    voice_choices = [v["name"] for v in _scan_voices()] or ["彪", "喆", "鑫"]
+    voices = _scan_voices()
+    voice_options = "".join(f'<option>{v["name"]}</option>' for v in voices) or "<option>彪</option><option>喆</option><option>鑫</option>"
+    style_options = "".join(f'<option>{s}</option>' for s in get_style_list())
+
+    html_ui = HTML_UI.replace("%VOICE_OPTIONS%", voice_options).replace("%STYLE_OPTIONS%", style_options)
 
     with gr.Blocks(
-        title="VoiceClone",
-        css=CSS,
-        head='<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        head='<meta name="viewport" content="width=device-width, initial-scale=1.0">' + JS_CODE
     ) as demo:
+        gr.HTML(html_ui)
 
-        # ── Waveform ──
-        gr.HTML(WAVEFORM_HTML)
+        hidden_request = gr.Textbox(value="", visible=False, elem_id="hidden-request", show_label=False)
+        hidden_response = gr.Textbox(value="", visible=False, elem_id="hidden-response", show_label=False)
+        output_audio = gr.Audio(autoplay=True, visible=False, show_label=False, elem_id="hidden-audio")
+        mic_audio = gr.Audio(sources=["microphone"], type="filepath", visible=False, elem_id="mic-trigger", show_label=False)
 
-        # ── Voice Selector ──
-        voice_dd = gr.Dropdown(
-            choices=voice_choices,
-            value=voice_choices[0] if voice_choices else None,
-            elem_id="voice-selector",
-            show_label=False,
-            interactive=True,
+        hidden_request.change(
+            fn=process,
+            inputs=[hidden_request],
+            outputs=[output_audio, hidden_response],
         )
 
-        # ── Mode + Style Row ──
-        with gr.Row(elem_id="control-row"):
-            mode_radio = gr.Radio(
-                choices=["语音聊天", "发送短信", "朗读内容"],
-                value="语音聊天",
-                elem_id="mode-radio",
-                show_label=False,
-                interactive=True,
-            )
-            style_dd = gr.Dropdown(
-                choices=style_list,
-                value=DEFAULT_STYLE,
-                elem_id="style-selector",
-                show_label=False,
-                visible=True,
-                interactive=True,
-            )
-
-        # ── Interaction Area ──
-        with gr.Column(visible=True, elem_id="voice-chat-panel") as voice_panel:
-            gr.HTML("""
-            <div class="mic-btn-wrap">
-              <button class="mic-btn" id="custom-mic-btn" type="button">
-                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-                  <rect x="8" y="2" width="8" height="13" rx="4"/>
-                  <path d="M4 11a8 8 0 0 0 16 0"/>
-                  <line x1="12" y1="18" x2="12" y2="22"/>
-                </svg>
-              </button>
-            </div>
-            <script>
-            (function(){
-              const micBtn = document.getElementById('custom-mic-btn');
-              let recording = false;
-              micBtn.addEventListener('click', () => {
-                recording = !recording;
-                micBtn.classList.toggle('recording', recording);
-                // Trigger Gradio's hidden mic component
-                const micAudio = document.querySelector('#mic-audio audio') ||
-                                 document.querySelector('#mic-audio button');
-                if (micAudio) micAudio.click();
-              });
-            })();
-            </script>
-            """)
-            mic_audio = gr.Audio(
-                sources=["microphone"],
-                type="filepath",
-                elem_id="mic-audio",
-                show_label=False,
-            )
-
-        with gr.Column(visible=False, elem_id="sms-panel") as sms_panel:
-            with gr.Row():
-                sms_input = gr.Textbox(
-                    placeholder="输入消息...",
-                    elem_id="sms-input",
-                    show_label=False,
-                    scale=5,
-                )
-                sms_btn = gr.Button("➤", elem_id="sms-btn", scale=1, size="sm")
-
-        with gr.Column(visible=False, elem_id="read-panel") as read_panel:
-            with gr.Row():
-                read_input = gr.Textbox(
-                    placeholder="输入要朗读的文字...",
-                    elem_id="read-input",
-                    show_label=False,
-                    scale=5,
-                )
-                read_btn = gr.Button("➤", elem_id="read-btn", scale=1, size="sm")
-
-        # ── Output ──
-        output_audio = gr.Audio(
-            autoplay=True,
-            visible=False,
-            show_label=False,
-        )
-        response_toast = gr.Markdown("", elem_id="response-toast")
-
-        # ── Events ──
-
-        mode_radio.change(
-            fn=on_mode_change,
-            inputs=[mode_radio],
-            outputs=[voice_panel, sms_panel, read_panel, style_dd],
-        )
+        def on_mic_stop(audio_path):
+            if not audio_path:
+                return None, None, ""
+            voice = _scan_voices()
+            voice_name = voice[0]["name"] if voice else "彪"
+            style = "清纯男高"
+            payload = json.dumps({"mode": "语音聊天", "voice": voice_name, "style": style, "text": "", "audio_path": audio_path})
+            return None, payload, ""
 
         mic_audio.stop_recording(
-            fn=on_voice_chat,
-            inputs=[mic_audio, voice_dd, style_dd],
-            outputs=[output_audio, response_toast],
-        )
-
-        mic_audio.clear(
-            fn=lambda: (None, ""),
-            inputs=[],
-            outputs=[output_audio, response_toast],
-        )
-
-        sms_btn.click(
-            fn=on_sms,
-            inputs=[sms_input, voice_dd, style_dd],
-            outputs=[output_audio, response_toast],
-        )
-        sms_input.submit(
-            fn=on_sms,
-            inputs=[sms_input, voice_dd, style_dd],
-            outputs=[output_audio, response_toast],
-        )
-
-        read_btn.click(
-            fn=on_read,
-            inputs=[read_input, voice_dd],
-            outputs=[output_audio, response_toast],
-        )
-        read_input.submit(
-            fn=on_read,
-            inputs=[read_input, voice_dd],
-            outputs=[output_audio, response_toast],
+            fn=on_mic_stop,
+            inputs=[mic_audio],
+            outputs=[mic_audio, hidden_request, hidden_response],
         )
 
     return demo
@@ -596,7 +447,8 @@ if __name__ == "__main__":
     demo.queue(default_concurrency_limit=20)
     demo.launch(
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
+        server_port=7860,
         share=True,
         theme=gr.themes.Soft(),
+        css=css,
     )

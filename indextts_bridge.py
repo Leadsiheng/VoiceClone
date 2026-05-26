@@ -53,15 +53,23 @@ def main():
 
         if cmd == "init":
             try:
-                _tts = IndexTTS2(
-                    cfg_path=req["cfg_path"],
-                    model_dir=req.get("model_dir", "checkpoints"),
-                    use_fp16=req.get("use_fp16", False),
-                    use_cuda_kernel=req.get("use_cuda_kernel", False),
-                    use_deepspeed=req.get("use_deepspeed", False),
-                )
+                # Suppress model loading noise to keep JSON protocol clean
+                import io
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    _tts = IndexTTS2(
+                        cfg_path=req["cfg_path"],
+                        model_dir=req.get("model_dir", "checkpoints"),
+                        use_fp16=req.get("use_fp16", False),
+                        use_cuda_kernel=req.get("use_cuda_kernel", False),
+                        use_deepspeed=req.get("use_deepspeed", False),
+                    )
+                finally:
+                    sys.stdout = old_stdout
                 print(json.dumps({"status": "ok"}))
             except Exception as e:
+                sys.stdout = old_stdout
                 print(json.dumps({"status": "error", "message": str(e)}))
 
         elif cmd == "infer":
@@ -83,13 +91,20 @@ def main():
                     if opt in req:
                         infer_kwargs[opt] = req[opt]
 
-                _tts.infer(**infer_kwargs)
+                import io
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    _tts.infer(**infer_kwargs)
+                finally:
+                    sys.stdout = old_stdout
 
                 print(json.dumps({
                     "status": "ok",
                     "output_path": infer_kwargs["output_path"],
                 }))
             except Exception as e:
+                sys.stdout = old_stdout
                 print(json.dumps({"status": "error", "message": str(e)}))
 
         elif cmd == "quit":
