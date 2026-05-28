@@ -38,3 +38,5 @@ Thumbs.db
 # Gradio
 gradio_cached_examples/
 flagged/
+transform/
+.gradio/

@@ -35,18 +35,10 @@ External dependencies:
 
 ### Start IndexTTS2 Native Web UI
 
-For testing voice cloning quality directly (upload reference audio + text → listen):
+For testing voice cloning quality directly:
 
 ```bash
-cd /Users/lish/Desktop/Projects/open\ code/DeepseekV4/VoiceClone
 bash scripts/start_indextts.sh
-```
-
-Or directly:
-
-```bash
-cd /Users/lish/Desktop/Projects/open\ code/DeepseekV4/index-tts
-uv run webui.py
 ```
 
 Opens at `http://localhost:7860`. Upload reference WAV → type text → hear cloned voice.
@@ -56,11 +48,10 @@ Opens at `http://localhost:7860`. Upload reference WAV → type text → hear cl
 TTS + LLM + ASR + custom UI:
 
 ```bash
-cd /Users/lish/Desktop/Projects/open\ code/DeepseekV4/VoiceClone
-python3 -u app.py
+bash scripts/start_voiceclone.sh
 ```
 
-Opens at `http://localhost:7860`. Shows desktop UI with waveform, mode tabs, voice/style selection.
+Opens at `http://localhost:7860`. Desktop UI with waveform, mode tabs, voice/style selection.
 
 ## Architecture
 
